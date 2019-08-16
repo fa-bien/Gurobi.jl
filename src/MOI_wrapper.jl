@@ -27,8 +27,12 @@ mutable struct VariableInfo
     lessthan_name::String
     greaterthan_interval_or_equalto_name::String
     type_constraint_name::String
+    # Storage for the lower bound if the variable is the `t` variable in a
+    # second order cone.
+    lower_bound_if_soc::Float64
+    num_soc_constraints::Int
     function VariableInfo(index::MOI.VariableIndex, column::Int)
-        return new(index, column, NONE, CONTINUOUS, nothing, "", "", "", "")
+        return new(index, column, NONE, CONTINUOUS, nothing, "", "", "", "", NaN, 0)
     end
 end
 
@@ -233,23 +237,6 @@ function MOI.supports_constraint(
     MOI.Semicontinuous{Float64}, MOI.Semiinteger{Float64}
 }}
     return true
-end
-
-function MOI.supports(
-    model, ::Optimizer, ::Union{MOI.ConstraintSet, MOI.ConstraintFunction},
-    ::Type{MOI.ConstraintIndex{F, S}}
-) where {F, S}
-    return MOI.supports_constraint(model, F, S)
-end
-
-function MOI.supports(
-    model, ::Optimizer, ::Union{MOI.ConstraintPrimal, MOI.ConstraintDual},
-    ::Type{MOI.ConstraintIndex{F, S}}
-) where {
-    F <: Union{MOI.SingleVariable, MOI.ScalarAffineFunction, MOI.ScalarQuadraticFunction},
-    S <: SCALAR_SETS
-}
-    return MOI.supports_constraint(model, F, S)
 end
 
 function MOI.supports_constraint(
@@ -899,14 +886,53 @@ function MOI.delete(
     return
 end
 
+"""
+    _set_variable_lower_bound(model, info, value)
+
+This function is used to indirectly set the lower bound of a variable. We need
+to do it this way, because if we add a SecondOrderCone constraint.
+"""
+function _set_variable_lower_bound(model, info, value)
+    if info.num_soc_constraints == 0
+        # No SOC constraints. Set directly.
+        @assert isnan(info.lower_bound_if_soc)
+        set_dblattrelement!(model.inner, "LB", info.column, value)
+        _require_update(model)
+    elseif value >= 0.0
+        # Regardless of whether there are SOC constraints, set directly.
+        info.lower_bound_if_soc = NaN
+        set_dblattrelement!(model.inner, "LB", info.column, value)
+        _require_update(model)
+    elseif isnan(info.lower_bound_if_soc)
+        # Previously, we had a +ve lower bound. We're setting this with a -ve
+        # one, but there are still some SOC constraints.
+        @assert value < 0.0
+        set_dblattrelement!(model.inner, "LB", info.column, 0.0)
+        _require_update(model)
+        info.lower_bound_if_soc = value
+    else
+        # Previously, we had a -ve lower bound. We're setting this with another
+        # -ve one, but there are still some SOC constraints.
+        @assert info.lower_bound_if_soc < 0.0
+        info.lower_bound_if_soc = value
+    end
+end
+
+function _get_variable_lower_bound(model, info)
+    if !isnan(info.lower_bound_if_soc)
+        # There is a value stored. Return that.
+        return info.lower_bound_if_soc
+    end
+    return get_dblattrelement(model.inner, "LB", info.column)
+end
+
 function MOI.delete(
     model::Optimizer,
     c::MOI.ConstraintIndex{MOI.SingleVariable, MOI.GreaterThan{Float64}}
 )
     MOI.throw_if_not_valid(model, c)
     info = _info(model, c)
-    set_dblattrelement!(model.inner, "LB", info.column, -Inf)
-    _require_update(model)
+    _set_variable_lower_bound(model, info, -Inf)
     if info.bound == LESS_AND_GREATER_THAN
         info.bound = LESS_THAN
     else
@@ -922,7 +948,7 @@ function MOI.delete(
 )
     MOI.throw_if_not_valid(model, c)
     info = _info(model, c)
-    set_dblattrelement!(model.inner, "LB", info.column, -Inf)
+    _set_variable_lower_bound(model, info, -Inf)
     set_dblattrelement!(model.inner, "UB", info.column, Inf)
     _require_update(model)
     info.bound = NONE
@@ -936,7 +962,7 @@ function MOI.delete(
 )
     MOI.throw_if_not_valid(model, c)
     info = _info(model, c)
-    set_dblattrelement!(model.inner, "LB", info.column, -Inf)
+    _set_variable_lower_bound(model, info, -Inf)
     set_dblattrelement!(model.inner, "UB", info.column, Inf)
     _require_update(model)
     info.bound = NONE
@@ -950,7 +976,7 @@ function MOI.get(
 )
     MOI.throw_if_not_valid(model, c)
     _update_if_necessary(model)
-    lower = get_dblattrelement(model.inner, "LB", _info(model, c).column)
+    lower = _get_variable_lower_bound(model, _info(model, c))
     return MOI.GreaterThan(lower)
 end
 
@@ -970,7 +996,7 @@ function MOI.get(
 )
     MOI.throw_if_not_valid(model, c)
     _update_if_necessary(model)
-    lower = get_dblattrelement(model.inner, "LB", _info(model, c).column)
+    lower = _get_variable_lower_bound(model, _info(model, c))
     return MOI.EqualTo(lower)
 end
 
@@ -981,7 +1007,7 @@ function MOI.get(
     MOI.throw_if_not_valid(model, c)
     _update_if_necessary(model)
     info = _info(model, c)
-    lower = get_dblattrelement(model.inner, "LB", info.column)
+    lower = _get_variable_lower_bound(model, _info(model, c))
     upper = get_dblattrelement(model.inner, "UB", info.column)
     return MOI.Interval(lower, upper)
 end
@@ -1022,7 +1048,7 @@ function MOI.set(
     lower, upper = _bounds(s)
     info = _info(model, c)
     if lower !== nothing
-        set_dblattrelement!(model.inner, "LB", info.column, lower)
+        _set_variable_lower_bound(model, info, lower)
     end
     if upper !== nothing
         set_dblattrelement!(model.inner, "UB", info.column, upper)
@@ -1098,7 +1124,7 @@ function MOI.add_constraint(
     _throw_if_existing_lower(info.bound, info.type, typeof(s), f.variable)
     _throw_if_existing_upper(info.bound, info.type, typeof(s), f.variable)
     set_charattrelement!(model.inner, "VType", info.column, Char('S'))
-    set_dblattrelement!(model.inner, "LB", info.column, s.lower)
+    _set_variable_lower_bound(model, info, s.lower)
     set_dblattrelement!(model.inner, "UB", info.column, s.upper)
     _require_update(model)
     info.type = SEMICONTINUOUS
@@ -1112,7 +1138,7 @@ function MOI.delete(
     MOI.throw_if_not_valid(model, c)
     info = _info(model, c)
     set_charattrelement!(model.inner, "VType", info.column, Char('C'))
-    set_dblattrelement!(model.inner, "LB", info.column, -Inf)
+    _set_variable_lower_bound(model, info, -Inf)
     set_dblattrelement!(model.inner, "UB", info.column, Inf)
     _require_update(model)
     info.type = CONTINUOUS
@@ -1127,7 +1153,7 @@ function MOI.get(
     MOI.throw_if_not_valid(model, c)
     info = _info(model, c)
     _update_if_necessary(model)
-    lower = get_dblattrelement(model.inner, "LB", info.column)
+    lower = _get_variable_lower_bound(model, info)
     upper = get_dblattrelement(model.inner, "UB", info.column)
     return MOI.Semicontinuous(lower, upper)
 end
@@ -1139,7 +1165,7 @@ function MOI.add_constraint(
     _throw_if_existing_lower(info.bound, info.type, typeof(s), f.variable)
     _throw_if_existing_upper(info.bound, info.type, typeof(s), f.variable)
     set_charattrelement!(model.inner, "VType", info.column, Char('N'))
-    set_dblattrelement!(model.inner, "LB", info.column, s.lower)
+    _set_variable_lower_bound(model, info, s.lower)
     set_dblattrelement!(model.inner, "UB", info.column, s.upper)
     _require_update(model)
     info.type = SEMIINTEGER
@@ -1153,7 +1179,7 @@ function MOI.delete(
     MOI.throw_if_not_valid(model, c)
     info = _info(model, c)
     set_charattrelement!(model.inner, "VType", info.column, Char('C'))
-    set_dblattrelement!(model.inner, "LB", info.column, -Inf)
+    _set_variable_lower_bound(model, info, -Inf)
     set_dblattrelement!(model.inner, "UB", info.column, Inf)
     _require_update(model)
     info.type = CONTINUOUS
@@ -1168,7 +1194,7 @@ function MOI.get(
     MOI.throw_if_not_valid(model, c)
     info = _info(model, c)
     _update_if_necessary(model)
-    lower = get_dblattrelement(model.inner, "LB", info.column)
+    lower = _get_variable_lower_bound(model, info)
     upper = get_dblattrelement(model.inner, "UB", info.column)
     return MOI.Semiinteger(lower, upper)
 end
@@ -1881,11 +1907,11 @@ function MOI.get(
     model::Optimizer, ::MOI.ConstraintDual,
     c::MOI.ConstraintIndex{MOI.SingleVariable, MOI.GreaterThan{Float64}}
 )
-    column = _info(model, c).column
-    x = get_dblattrelement(model.inner, "X", column)
-    lb = get_dblattrelement(model.inner, "LB", column)
+    info = _info(model, c)
+    x = get_dblattrelement(model.inner, "X", info.column)
+    lb = _get_variable_lower_bound(model, info)
     if x ≈ lb
-        return _dual_multiplier(model) * get_dblattrelement(model.inner, "RC", column)
+        return _dual_multiplier(model) * get_dblattrelement(model.inner, "RC", info.column)
     else
         return 0.0
     end
@@ -2575,19 +2601,26 @@ function MOI.add_constraint(
     if length(f.variables) != s.dimension
         error("Dimension of $(s) does not match number of terms in $(f)")
     end
+
     # SOC is the cone: t ≥ ||x||₂ ≥ 0. In quadratic form, this is
     # t² - Σᵢ xᵢ² ≥ 0 and t ≥ 0.
 
     # First, check the lower bound on t.
 
-    # TODO(odow): a better way to set the lower bound.
+    _update_if_necessary(model)
     t_info = _info(model, f.variables[1])
-    set_dblattrelement!(model.inner, "LB", t_info.column, 0.0)
+    lb = _get_variable_lower_bound(model, t_info)
+    if isnan(t_info.lower_bound_if_soc) && lb < 0.0
+        t_info.lower_bound_if_soc = lb
+        set_dblattrelement!(model.inner, "LB", t_info.column, 0.0)
+    end
+    t_info.num_soc_constraints += 1
 
     # Now add the quadratic constraint.
 
     I = Cint[_info(model, v).column for v in f.variables]
-    V = Cdouble[i == 1 ? 1.0 : -1.0 for i in 1:length(f.variables)]
+    V = fill(Cdouble(-1.0), length(f.variables))
+    V[1] = 1.0
     add_qconstr!(model.inner, Cint[], Cdouble[], I, I, V, Cchar('>'), 0.0)
     _require_update(model)
     model.last_constraint_index += 1
@@ -2609,6 +2642,7 @@ function MOI.delete(
     c::MOI.ConstraintIndex{MOI.VectorOfVariables, MOI.SecondOrderCone}
 )
     _update_if_necessary(model)
+    f = MOI.get(model, MOI.ConstraintFunction(), c)
     info = _info(model, c)
     delqconstrs!(model.inner, [info.row])
     _require_update(model)
@@ -2619,6 +2653,23 @@ function MOI.delete(
     end
     model.name_to_constraint_index = nothing
     delete!(model.quadratic_constraint_info, c.value)
+    # Reset the lower bound on the `t` variable.
+    t_info = _info(model, f.variables[1])
+    t_info.num_soc_constraints -= 1
+    if t_info.num_soc_constraints > 0
+        # Don't do anything. There are still SOC associated with this variable.
+        return
+    elseif isnan(t_info.lower_bound_if_soc)
+        # Don't do anything. It must have a >0 lower bound anyway.
+        return
+    end
+    # There was a previous bound that we over-wrote, and it must have been
+    # < 0 otherwise we wouldn't have needed to overwrite it.
+    @assert t_info.lower_bound_if_soc < 0.0
+    tmp_lower_bound = t_info.lower_bound_if_soc
+    t_info.lower_bound_if_soc = NaN
+    set_dblattrelement!(model.inner, "LB", t_info.column, tmp_lower_bound)
+    _require_update(model)
     return
 end
 
@@ -2641,11 +2692,11 @@ function MOI.get(
     for (i, j, coef) in zip(I, J, V)
         v = model.variable_info[CleverDicts.LinearIndex(i + 1)].index
         @assert i == j  # Check for no off-diagonals.
-        if coef == 1
+        if coef == 1.0
             @assert t === nothing  # There should only be one `t`.
             t = v
         else
-            @assert coef == -1  # The coefficients _must_ be -1 for `x` terms.
+            @assert coef == -1.0  # The coefficients _must_ be -1 for `x` terms.
             push!(x, v)
         end
     end
